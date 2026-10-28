@@ -1,0 +1,542 @@
+diff --git a/package.json b/package.json
+index 2b1d945..60cb360 100644
+--- a/package.json
++++ b/package.json
+@@ -4,7 +4,8 @@
+   "main": "index.js",
+   "license": "MIT",
+   "scripts": {
+-    "dev": "nodemon -L src/index.js"
++    "dev": "nodemon -L src/index.js",
++    "test": "jest"
+   },
+   "dependencies": {
+     "express": "^5.2.1",
+@@ -14,6 +15,7 @@
+     "wait-port": "^1.1.0"
+   },
+   "devDependencies": {
++    "jest": "^29.7.0",
+     "nodemon": "^3.1.9"
+   },
+   "overrides": {
+@@ -25,4 +27,4 @@
+     "http-cache-semantics": "4.1.1",
+     "socks": "2.8.1"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/spec/routes/addItem.spec.js b/spec/routes/addItem.spec.js
+index f60c06b..ea90019 100644
+--- a/spec/routes/addItem.spec.js
++++ b/spec/routes/addItem.spec.js
+@@ -28,3 +28,18 @@ test('it stores item correctly', async () => {
+     expect(res.send.mock.calls[0].length).toBe(1);
+     expect(res.send.mock.calls[0][0]).toEqual(expectedItem);
+ });
++test.each([
++    ['missing body', undefined],
++    ['whitespace name', { name: '   ' }],
++    ['object name', { name: { $gt: '' } }],
++    ['name over 255 characters', { name: 'a'.repeat(256) }],
++])('it rejects %s with 400', async (_, body) => {
++    db.storeItem.mockClear();
++    const res = { send: jest.fn() };
++    res.status = jest.fn(() => res);
++
++    await addItem({ body }, res);
++
++    expect(res.status).toHaveBeenCalledWith(400);
++    expect(db.storeItem).not.toHaveBeenCalled();
++});
+diff --git a/spec/routes/updateItem.spec.js b/spec/routes/updateItem.spec.js
+index 640e56e..ecc894b 100644
+--- a/spec/routes/updateItem.spec.js
++++ b/spec/routes/updateItem.spec.js
+@@ -7,12 +7,20 @@ jest.mock('../../src/persistence', () => ({
+     updateItem: jest.fn(),
+ }));
+ 
++const response = () => {
++    const res = { send: jest.fn() };
++    res.status = jest.fn(() => res);
++    return res;
++};
++
++beforeEach(() => jest.clearAllMocks());
++
+ test('it updates items correctly', async () => {
+     const req = {
+         params: { id: 1234 },
+-        body: { name: 'New title', completed: false },
++        body: { name: '  New title  ', completed: false },
+     };
+-    const res = { send: jest.fn() };
++    const res = response();
+ 
+     db.getItem.mockReturnValue(Promise.resolve(ITEM));
+ 
+@@ -25,9 +33,46 @@ test('it updates items correctly', async () => {
+         completed: false,
+     });
+ 
+-    expect(db.getItem.mock.calls.length).toBe(1);
+-    expect(db.getItem.mock.calls[0][0]).toBe(req.params.id);
++    expect(db.getItem).toHaveBeenCalledWith(req.params.id);
++    expect(res.status).not.toHaveBeenCalled();
++    expect(res.send).toHaveBeenCalledWith(ITEM);
++});
++
++test('it returns 404 for an unknown item and writes nothing', async () => {
++    const res = response();
++    db.getItem.mockReturnValue(Promise.resolve(undefined));
++
++    await updateItem({ params: { id: 'nope' }, body: { name: 'x', completed: true } }, res);
++
++    expect(res.status).toHaveBeenCalledWith(404);
++    expect(res.send).toHaveBeenCalledWith({ error: 'Item not found.' });
++    expect(db.updateItem).not.toHaveBeenCalled();
++});
++
++test.each([
++    ['missing body', undefined],
++    ['empty name', { name: '', completed: false }],
++    ['whitespace name', { name: '   ', completed: false }],
++    ['numeric name', { name: 42, completed: false }],
++    ['name over 255 characters', { name: 'a'.repeat(256), completed: false }],
++    ['missing completed', { name: 'ok' }],
++    ['string completed', { name: 'ok', completed: 'yes' }],
++])('it rejects %s with 400', async (_, body) => {
++    const res = response();
++
++    await updateItem({ params: { id: 1 }, body }, res);
++
++    expect(res.status).toHaveBeenCalledWith(400);
++    expect(res.send.mock.calls[0][0]).toHaveProperty('error');
++    expect(db.updateItem).not.toHaveBeenCalled();
++});
++
++test('it accepts a name of exactly 255 characters', async () => {
++    const res = response();
++    db.getItem.mockReturnValue(Promise.resolve(ITEM));
++
++    await updateItem({ params: { id: 1 }, body: { name: 'a'.repeat(255), completed: true } }, res);
+ 
+-    expect(res.send.mock.calls[0].length).toBe(1);
+-    expect(res.send.mock.calls[0][0]).toEqual(ITEM);
++    expect(res.status).not.toHaveBeenCalled();
++    expect(db.updateItem.mock.calls[0][1].name).toHaveLength(255);
+ });
+diff --git a/src/index.js b/src/index.js
+index 7e8e772..b903120 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -14,6 +14,16 @@ app.post('/items', addItem);
+ app.put('/items/:id', updateItem);
+ app.delete('/items/:id', deleteItem);
+ 
++// Express's default handler prints stack traces outside production.
++app.use((err, req, res, next) => {
++    if (err.type === 'entity.parse.failed')
++        return res.status(400).send({ error: 'Request body must be valid JSON.' });
++    if (err.type === 'entity.too.large')
++        return res.status(413).send({ error: 'Request body is too large.' });
++    console.error(err);
++    res.status(err.status || 500).send({ error: 'Something went wrong.' });
++});
++
+ db.init().then(() => {
+     app.listen(3000, () => console.log('Listening on port 3000'));
+ }).catch((err) => {
+diff --git a/src/routes/addItem.js b/src/routes/addItem.js
+index 90dfe06..9e12d97 100644
+--- a/src/routes/addItem.js
++++ b/src/routes/addItem.js
+@@ -1,10 +1,14 @@
+ const db = require('../persistence');
+ const {v4 : uuid} = require('uuid');
++const { parseItemName } = require('./itemName');
+ 
+ module.exports = async (req, res) => {
++    const { name, error } = parseItemName(req.body?.name);
++    if (error) return res.status(400).send({ error });
++
+     const item = {
+         id: uuid(),
+-        name: req.body.name,
++        name,
+         completed: false,
+     };
+ 
+diff --git a/src/routes/itemName.js b/src/routes/itemName.js
+new file mode 100644
+index 0000000..88ae6e8
+--- /dev/null
++++ b/src/routes/itemName.js
+@@ -0,0 +1,13 @@
++// Both schemas declare name as varchar(255).
++const MAX_NAME_LENGTH = 255;
++
++function parseItemName(value) {
++    if (typeof value !== 'string') return { error: 'Name must be text.' };
++    const name = value.trim();
++    if (!name) return { error: 'Name cannot be empty.' };
++    if (name.length > MAX_NAME_LENGTH)
++        return { error: `Name must be ${MAX_NAME_LENGTH} characters or fewer.` };
++    return { name };
++}
++
++module.exports = { parseItemName, MAX_NAME_LENGTH };
+diff --git a/src/routes/updateItem.js b/src/routes/updateItem.js
+index c2f5871..9f008b8 100644
+--- a/src/routes/updateItem.js
++++ b/src/routes/updateItem.js
+@@ -1,8 +1,17 @@
+ const db = require('../persistence');
++const { parseItemName } = require('./itemName');
+ 
+ module.exports = async (req, res) => {
++    const { name, error } = parseItemName(req.body?.name);
++    if (error) return res.status(400).send({ error });
++    if (typeof req.body.completed !== 'boolean')
++        return res.status(400).send({ error: 'Completed must be true or false.' });
++
++    if (!(await db.getItem(req.params.id)))
++        return res.status(404).send({ error: 'Item not found.' });
++
+     await db.updateItem(req.params.id, {
+-        name: req.body.name,
++        name,
+         completed: req.body.completed,
+     });
+     const item = await db.getItem(req.params.id);
+diff --git a/src/static/css/styles.css b/src/static/css/styles.css
+index 5ee2e28..b6c9c83 100644
+--- a/src/static/css/styles.css
++++ b/src/static/css/styles.css
+@@ -28,12 +28,18 @@ body {
+ 
+ .name {
+     padding-top: 3px;
++    min-width: 0;
++    overflow-wrap: anywhere;
+ }
+ 
+-.remove {
+-    padding-left: 0;
++.rename-row {
++    gap: 0.5rem;
+ }
+ 
+ button:focus {
+     border: 1px solid #333;
+-}
+\ No newline at end of file
++}
++/* Keep the item text the same size when a row switches to edit mode. */
++.rename-row .form-control {
++    font-size: 1rem;
++}
+diff --git a/src/static/index.html b/src/static/index.html
+index 3f6fb5b..2a78e89 100644
+--- a/src/static/index.html
++++ b/src/static/index.html
+@@ -1,9 +1,9 @@
+ 
+ <!DOCTYPE html>
+-<html>
++<html lang="en">
+ <head>
+     <meta charset="utf-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no, maximum-scale=1.0, user-scalable=0" />
++    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+     <link rel="stylesheet" href="css/bootstrap.min.css" crossorigin="anonymous" />
+     <link rel="stylesheet" href="css/font-awesome/all.min.css" crossorigin="anonymous" />
+     <link href="https://fonts.googleapis.com/css?family=Lato&display=swap" rel="stylesheet" />
+diff --git a/src/static/js/app.js b/src/static/js/app.js
+index 4ec962c..ab698de 100644
+--- a/src/static/js/app.js
++++ b/src/static/js/app.js
+@@ -67,55 +67,111 @@ function TodoListCard() {
+     );
+ }
+ 
++// Mirrors MAX_NAME_LENGTH in src/routes/itemName.js.
++const MAX_NAME_LENGTH = 255;
++
++const REQUEST_TIMEOUT_MS = 15000;
++
++function requestJson(url, options) {
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
++
++    return fetch(url, Object.assign({}, options, { signal: controller.signal }))
++        .then(
++            response =>
++                response
++                    .json()
++                    .catch(() => ({}))
++                    .then(body => {
++                        if (!response.ok)
++                            throw new Error(body.error || `Request failed (${response.status}).`);
++                        return body;
++                    }),
++            err => {
++                throw new Error(
++                    err.name === 'AbortError'
++                        ? 'The server took too long to respond. Try again.'
++                        : 'Could not reach the server. Try again.',
++                );
++            },
++        )
++        .finally(() => clearTimeout(timer));
++}
++
+ function AddItemForm({ onNewItem }) {
+     const { Form, InputGroup, Button } = ReactBootstrap;
+ 
+     const [newItem, setNewItem] = React.useState('');
+     const [submitting, setSubmitting] = React.useState(false);
++    const [error, setError] = React.useState('');
+ 
+     const submitNewItem = e => {
+         e.preventDefault();
+         setSubmitting(true);
+-        fetch('/items', {
++        setError('');
++        requestJson('/items', {
+             method: 'POST',
+             body: JSON.stringify({ name: newItem }),
+             headers: { 'Content-Type': 'application/json' },
+         })
+-            .then(r => r.json())
+             .then(item => {
+                 onNewItem(item);
+-                setSubmitting(false);
+                 setNewItem('');
+-            });
++            })
++            .catch(err => setError(err.message))
++            .then(() => setSubmitting(false));
+     };
+ 
+     return (
+-        <Form onSubmit={submitNewItem}>
+-            <InputGroup className="mb-3">
++        <Form onSubmit={submitNewItem} className="mb-3">
++            <InputGroup>
+                 <Form.Control
+                     value={newItem}
+                     onChange={e => setNewItem(e.target.value)}
+                     type="text"
+                     placeholder="New Item"
+-                    aria-describedby="basic-addon1"
++                    aria-label="New item name"
++                    maxLength={MAX_NAME_LENGTH}
++                    isInvalid={Boolean(error)}
++                    aria-describedby={error ? 'new-item-error' : undefined}
+                 />
+                 <InputGroup.Append>
+                     <Button
+                         type="submit"
+                         variant="success"
+-                        disabled={!newItem.length}
+-                        className={submitting ? 'disabled' : ''}
++                        disabled={submitting || !newItem.trim()}
+                     >
+                         {submitting ? 'Adding...' : 'Add Item'}
+                     </Button>
+                 </InputGroup.Append>
+             </InputGroup>
++            {error && (
++                <div id="new-item-error" className="invalid-feedback d-block" role="alert">
++                    {error}
++                </div>
++            )}
+         </Form>
+     );
+ }
+ 
+ function ItemDisplay({ item, onItemUpdate, onItemRemoval }) {
+-    const { Container, Row, Col, Button } = ReactBootstrap;
++    const { Button } = ReactBootstrap;
++
++    const [editing, setEditing] = React.useState(false);
++    const editButton = React.useRef(null);
++    const restoreFocus = React.useRef(false);
++
++    React.useLayoutEffect(() => {
++        if (!editing && restoreFocus.current) {
++            restoreFocus.current = false;
++            editButton.current.focus();
++        }
++    }, [editing]);
++
++    const stopEditing = () => {
++        restoreFocus.current = true;
++        setEditing(false);
++    };
+ 
+     const toggleCompletion = () => {
+         fetch(`/items/${item.id}`, {
+@@ -136,43 +192,123 @@ function ItemDisplay({ item, onItemUpdate, onItemRemoval }) {
+         );
+     };
+ 
++    if (editing)
++        return (
++            <RenameItemForm
++                item={item}
++                onSaved={updated => {
++                    onItemUpdate(updated);
++                    stopEditing();
++                }}
++                onCancel={stopEditing}
++            />
++        );
++
+     return (
+-        <Container fluid className={`item ${item.completed && 'completed'}`}>
+-            <Row>
+-                <Col xs={1} className="text-center">
+-                    <Button
+-                        className="toggles"
+-                        size="sm"
+-                        variant="link"
+-                        onClick={toggleCompletion}
+-                        aria-label={
+-                            item.completed
+-                                ? 'Mark item as incomplete'
+-                                : 'Mark item as complete'
+-                        }
+-                    >
+-                        <i
+-                            className={`far ${
+-                                item.completed ? 'fa-check-square' : 'fa-square'
+-                            }`}
+-                        />
+-                    </Button>
+-                </Col>
+-                <Col xs={10} className="name">
+-                    {item.name}
+-                </Col>
+-                <Col xs={1} className="text-center remove">
+-                    <Button
+-                        size="sm"
+-                        variant="link"
+-                        onClick={removeItem}
+-                        aria-label="Remove Item"
+-                    >
+-                        <i className="fa fa-trash text-danger" />
+-                    </Button>
+-                </Col>
+-            </Row>
+-        </Container>
++        <div className={`item d-flex align-items-start${item.completed ? ' completed' : ''}`}>
++            <Button
++                className="toggles"
++                size="sm"
++                variant="link"
++                onClick={toggleCompletion}
++                aria-label={
++                    item.completed
++                        ? `Mark "${item.name}" as incomplete`
++                        : `Mark "${item.name}" as complete`
++                }
++            >
++                <i className={`far ${item.completed ? 'fa-check-square' : 'fa-square'}`} />
++            </Button>
++            <span className="name flex-grow-1">{item.name}</span>
++            <Button
++                ref={editButton}
++                size="sm"
++                variant="link"
++                className="text-secondary"
++                onClick={() => setEditing(true)}
++                aria-label={`Rename "${item.name}"`}
++            >
++                <i className="fa fa-pen" />
++            </Button>
++            <Button
++                size="sm"
++                variant="link"
++                onClick={removeItem}
++                aria-label={`Remove "${item.name}"`}
++            >
++                <i className="fa fa-trash text-danger" />
++            </Button>
++        </div>
++    );
++}
++
++function RenameItemForm({ item, onSaved, onCancel }) {
++    const { Form, Button } = ReactBootstrap;
++
++    const [draft, setDraft] = React.useState(item.name);
++    const [saving, setSaving] = React.useState(false);
++    const [error, setError] = React.useState('');
++    const input = React.useRef(null);
++
++    React.useLayoutEffect(() => {
++        input.current.focus();
++        input.current.select();
++    }, []);
++
++    const save = e => {
++        e.preventDefault();
++        if (draft.trim() === item.name) return onCancel();
++
++        setSaving(true);
++        setError('');
++        requestJson(`/items/${item.id}`, {
++            method: 'PUT',
++            body: JSON.stringify({ name: draft, completed: item.completed }),
++            headers: { 'Content-Type': 'application/json' },
++        })
++            .then(onSaved)
++            .catch(err => {
++                setError(err.message);
++                setSaving(false);
++            });
++    };
++
++    const inputId = `rename-${item.id}`;
++    const errorId = `rename-error-${item.id}`;
++
++    return (
++        <Form className="item" onSubmit={save}>
++            <label htmlFor={inputId} className="sr-only">
++                New name for "{item.name}"
++            </label>
++            <div className="d-flex align-items-center rename-row">
++                <Form.Control
++                    id={inputId}
++                    ref={input}
++                    size="sm"
++                    value={draft}
++                    maxLength={MAX_NAME_LENGTH}
++                    onChange={e => setDraft(e.target.value)}
++                    onKeyDown={e => {
++                        if (e.key === 'Escape' && !saving) onCancel();
++                    }}
++                    readOnly={saving}
++                    isInvalid={Boolean(error)}
++                    aria-describedby={error ? errorId : undefined}
++                />
++                <Button type="submit" size="sm" variant="success" disabled={saving || !draft.trim()}>
++                    {saving ? 'Saving...' : 'Save'}
++                </Button>
++                <Button size="sm" variant="link" onClick={onCancel} disabled={saving}>
++                    Cancel
++                </Button>
++            </div>
++            {error && (
++                <div id={errorId} className="invalid-feedback d-block" role="alert">
++                    {error}
++                </div>
++            )}
++        </Form>
+     );
+ }
+ 
